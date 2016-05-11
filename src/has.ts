@@ -125,7 +125,7 @@ export default function has(feature: string): TestResult {
 /*
  * OOTB feature tests
  */
-add('host-browser', typeof document !== 'undefined' && typeof location !== 'undefined');
+add('host-browser', (typeof document !== 'undefined' && typeof location !== 'undefined') || (<any> require).isBrowser);
 add('host-node', function () {
 	if (typeof process === 'object' && process.versions && process.versions.node) {
 		return process.versions.node;

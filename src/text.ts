@@ -53,13 +53,13 @@ else if (has('host-node')) {
 	const nodeReq = has('host-rjs') ? global.requirejsVars.nodeRequire : (require.nodeRequire || require);
 	const fs = nodeReq('fs');
 	getText = function(url: string, callback: (value: string) => void): void {
-		fs.readFile(url, { encoding: 'utf8' }, function(error: Error, data: string): void {
-			if (error) {
-				throw error;
-			}
-
+		try {
+			let data: string = fs.readFileSync(url, 'utf8');
 			callback(data);
-		});
+		}
+		catch (error) {
+			throw error;
+		}
 	};
 }
 else {

@@ -1,60 +1,55 @@
 import * as registerSuite from 'intern!object';
 import * as assert from 'intern/chai!assert';
 import * as timing from '../../../src/async/timing';
-import { throwImmediatly } from '../../support/util';
 import { isEventuallyRejected } from '../../support/util';
-import Promise from 'dojo-shim/Promise';
+import 'dojo-shim/Promise';
 
 registerSuite({
 	name: 'async/timing',
 
 	'delay()': {
-		'delay returning a value after the given timeout': function () {
-			return timing.delay(251)(Date.now()).then(function (start: number) {
-				const diff: number = Date.now() - start;
-				assert.isAbove(diff, 249);
-			});
+		'delay returning a value after the given timeout': async function () {
+			let start: number = await timing.delay<number>(251)(Date.now());
+			const diff: number = Date.now() - start;
+			assert.isAbove(diff, 249);
 		},
-		'delay executing a function that returns a value after the given timeout': function () {
+		'delay executing a function that returns a value after the given timeout': async function () {
 			const now = Date.now();
 			const getNow = function() {
 				return Date.now();
 			};
-			return timing.delay(251)( getNow ).then(function (finish: number) {
-				const diff: number = finish - now;
-				assert.isAbove(diff, 249);
-			});
+			let finish = await timing.delay<number>(251)(getNow);
+
+			const diff: number = finish - now;
+			assert.isAbove(diff, 249);
 		},
-		'delay executing a function that returns another promise after the given timeout': function () {
+		'delay executing a function that returns another promise after the given timeout': async function () {
 			const now = Date.now();
 			const getNow = function() {
 				return Promise.resolve( Date.now() );
 			};
-			return timing.delay(251)( getNow ).then(function (finish: number) {
-				const diff: number = finish - now;
-				assert.isAbove(diff, 249);
-			});
+			let finish = await timing.delay<number>(251)(getNow);
+			const diff: number = finish - now;
+			assert.isAbove(diff, 249);
 		},
-		'delay should return undefined when the value is not passed in': function () {
-			return timing.delay(251)().then(function (value) {
-				assert.isUndefined(value);
-			});
+		'delay should return undefined when the value is not passed in': async function () {
+			let value = await timing.delay(251)();
+			assert.isUndefined(value);
 		},
-		'delay can be reusable': function () {
+		'delay can be reusable': async function () {
 			const start = Date.now();
 			const delay = timing.delay(251);
-			const p1 = delay().then(function() {
-				assert.isAbove(Date.now() - start, 249);
-			});
-			const p2 = delay('foo').then(function(value) {
-				assert.strictEqual(value, 'foo');
-				assert.isAbove(Date.now() - start, 249);
-			});
-			const p3 = delay(() => Promise.resolve('bar')).then(function(value) {
-				assert.strictEqual(value, 'bar');
-				assert.isAbove(Date.now() - start, 249);
-			});
-			return Promise.all([p1, p2, p3]);
+
+			await delay();
+			assert.isAbove(Date.now() - start, 249);
+
+			let fooValue = await delay('foo');
+			assert.strictEqual(fooValue, 'foo');
+			assert.isAbove(Date.now() - start, 249);
+
+			let promiseValue = await delay(() => Promise.resolve('bar'));
+			assert.strictEqual(promiseValue, 'bar');
+			assert.isAbove(Date.now() - start, 249);
 		}
 	},
 
@@ -72,23 +67,28 @@ registerSuite({
 	},
 
 	'DelayedRejection': {
-		'is eventually rejected': function () {
+		'is eventually rejected': async function () {
 			const start = Date.now();
-			return new timing.DelayedRejection(101).then<any>(throwImmediatly, function (reason) {
+			try {
+				await new timing.DelayedRejection(101);
+				assert(false, 'should have failed');
+			} catch (reason) {
 				assert.isUndefined(reason);
 				assert.isAbove(Date.now(), start + 99);
-				return true;
-			});
+			}
 		},
 
-		'is eventually rejected with error': function () {
+		'is eventually rejected with error': async function () {
 			const start = Date.now();
 			const expectedError = new Error('boom!');
-			return new timing.DelayedRejection(101, expectedError).then<any>(throwImmediatly, function (reason) {
+
+			try {
+				await new timing.DelayedRejection(101, expectedError);
+				assert(false, 'should have failed');
+			} catch (reason) {
 				assert.strictEqual(reason, expectedError);
 				assert.isAbove(Date.now(), start + 99);
-				return true;
-			});
+			}
 		},
 
 		'works with race': function () {

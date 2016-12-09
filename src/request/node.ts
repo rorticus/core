@@ -5,8 +5,6 @@ import * as http from 'http';
 import * as https from 'https';
 import { createHandle } from '../lang';
 import { RequestOptions, Response, ResponsePromise } from '../request';
-import ReadableStream from 'dojo-streams/ReadableStream';
-import WritableStream from 'dojo-streams/WritableStream';
 import * as urlUtil from 'url';
 import { generateRequestUrl } from './util';
 
@@ -61,7 +59,7 @@ export interface NodeRequestOptions<T> extends RequestOptions {
 	};
 	streamData?: boolean;
 	streamEncoding?: string;
-	streamTarget?: WritableStream<T>;
+	streamTarget?: any;
 	redirectOptions?: {
 		limit?: number;
 		count?: number;
@@ -324,7 +322,7 @@ function node<T>(url: string, options: NodeRequestOptions<T> = {}): ResponseProm
 		request.once('error', reject);
 
 		if (options.data) {
-			if (options.data instanceof ReadableStream) {
+			if (typeof options.data.pipeTo === 'function') {
 				streamHandlers.streamDataHandler(options, request, response, reject);
 			}
 			else {

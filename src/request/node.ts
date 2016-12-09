@@ -4,9 +4,7 @@ import { Handle } from 'dojo-interfaces/core';
 import * as http from 'http';
 import * as https from 'https';
 import { createHandle } from '../lang';
-import { RequestError, RequestOptions, Response, ResponsePromise } from '../request';
-import ReadableNodeStreamSource from 'dojo-streams/adapters/ReadableNodeStreamSource';
-import WritableNodeStreamSink from 'dojo-streams/adapters/WritableNodeStreamSink';
+import { RequestOptions, Response, ResponsePromise } from '../request';
 import ReadableStream from 'dojo-streams/ReadableStream';
 import WritableStream from 'dojo-streams/WritableStream';
 import * as urlUtil from 'url';
@@ -101,7 +99,23 @@ function redirect<T>(resolve: (p?: any) => void, reject: (_?: Error) => void, ur
 	return true;
 }
 
-export default function node<T>(url: string, options: NodeRequestOptions<T> = {}): ResponsePromise<T> {
+export interface StreamHandlers {
+	streamTargetHandler<T>(options: NodeRequestOptions<T>, request: http.ClientRequest, nativeResponse: http.ClientResponse, response: Response<T>, resolve: (p?: any) => void, reject: (_?: Error) => void): void;
+	streamCompleteHandler<T>(options: NodeRequestOptions<T>): void;
+	streamDataHandler<T>(options: NodeRequestOptions<T>, request: http.ClientRequest, response: Response<T>, reject: (_?: Error) => void): void;
+}
+
+function needStreamsError() {
+	throw new Error('To use streams with node/request, import dojo/streams request and register the stream handlers.');
+}
+
+export const streamHandlers: StreamHandlers = {
+	streamTargetHandler: <any> needStreamsError,
+	streamCompleteHandler: <any> needStreamsError,
+	streamDataHandler: <any> needStreamsError
+};
+
+function node<T>(url: string, options: NodeRequestOptions<T> = {}): ResponsePromise<T> {
 	const requestUrl = generateRequestUrl(url, options);
 	const parsedUrl = urlUtil.parse(options.proxy || requestUrl);
 	const requestOptions: HttpsOptions = {
@@ -272,26 +286,7 @@ export default function node<T>(url: string, options: NodeRequestOptions<T> = {}
 
 			options.streamEncoding && nativeResponse.setEncoding(options.streamEncoding);
 			if (options.streamTarget) {
-				const responseSource = new ReadableNodeStreamSource(nativeResponse);
-				const responseReadableStream = new ReadableStream(responseSource);
-
-				responseReadableStream.pipeTo(<any> options.streamTarget)
-					.then(
-						function () {
-							resolve(response);
-						},
-						function (error: RequestError<T>) {
-							if (options.streamTarget) {
-								// abort the stream, swallowing any errors,
-								// (because we've already got an error, and we can't catch this one)
-								options.streamTarget.abort(error).catch(() => {
-								});
-							}
-							request.abort();
-							error.response = response;
-							reject(error);
-						}
-					);
+				streamHandlers.streamTargetHandler(options, request, nativeResponse, response, resolve, reject);
 			}
 
 			let data: any[];
@@ -321,8 +316,7 @@ export default function node<T>(url: string, options: NodeRequestOptions<T> = {}
 					resolve(response);
 				}
 				else {
-					options.streamTarget.close().catch(() => {
-					});
+					streamHandlers.streamCompleteHandler(options);
 				}
 			});
 		});
@@ -331,15 +325,7 @@ export default function node<T>(url: string, options: NodeRequestOptions<T> = {}
 
 		if (options.data) {
 			if (options.data instanceof ReadableStream) {
-				const requestSink = new WritableNodeStreamSink(request);
-				const writableRequest = new WritableStream(requestSink);
-				options.data.pipeTo(writableRequest)
-					.catch(function (error: RequestError<T>) {
-						error.response = response;
-						writableRequest.abort(error).catch(() => {
-						});
-						reject(error);
-					});
+				streamHandlers.streamDataHandler(options, request, response, reject);
 			}
 			else {
 				request.end(options.data);
@@ -378,4 +364,6 @@ export default function node<T>(url: string, options: NodeRequestOptions<T> = {}
 	});
 
 	return promise;
-}
+};
+
+export default node;

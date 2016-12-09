@@ -4,6 +4,9 @@ import * as DojoPromise from 'intern/dojo/Promise';
 import request, { RequestOptions } from '../../src/request';
 import { createServer } from 'http';
 import { parse } from 'url';
+import { default as nodeProvider } from '../../src/request/node';
+
+request.setDefaultProvider(nodeProvider);
 
 let handle: any;
 

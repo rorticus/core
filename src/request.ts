@@ -1,10 +1,8 @@
-import Promise from 'dojo-shim/Promise';
 import Task from './async/Task';
-import has from './request/has';
 import { Handle } from 'dojo-interfaces/core';
 import MatchRegistry, { Test } from './MatchRegistry';
-import load from './load';
 import { ParamList } from './UrlSearchParams';
+import xhr from './request/xhr';
 
 declare var require: any;
 
@@ -31,53 +29,7 @@ export class FilterRegistry extends MatchRegistry<RequestFilter> {
 	}
 }
 
-let defaultProvider = './request/xhr';
-if (has('host-node')) {
-	defaultProvider = './request/node';
-}
-
 export class ProviderRegistry extends MatchRegistry<RequestProvider> {
-	private _providerPromise: Promise<RequestProvider>;
-
-	constructor() {
-		super();
-
-		const deferRequest = (url: string, options?: RequestOptions): ResponsePromise<any> => {
-			let canceled = false;
-			let actualResponse: ResponsePromise<any>;
-			return new Task<Response<any>>((resolve, reject) => {
-				this._providerPromise.then(function (provider) {
-					if (canceled) {
-						return;
-					}
-					if (provider) {
-						actualResponse = provider(url, options);
-						actualResponse.then(resolve, reject);
-					}
-				});
-			}, function () {
-				if (!canceled) {
-					canceled = true;
-				}
-				if (actualResponse) {
-					actualResponse.cancel();
-				}
-			});
-		};
-
-		// The first request to hit the default value will kick off the import of the default
-		// provider. While that import is in-flight, subsequent requests will queue up while
-		// waiting for the provider to be fulfilled.
-		this._defaultValue = (url: string, options?: RequestOptions): ResponsePromise<any> => {
-			this._providerPromise = load(require, defaultProvider).then(([ providerModule ]: [ { default: RequestProvider } ]): RequestProvider => {
-				this._defaultValue = providerModule.default;
-				return providerModule.default;
-			});
-			this._defaultValue = deferRequest;
-			return deferRequest(url, options);
-		};
-	}
-
 	register(test: string | RegExp | RequestProviderTest | null, value: RequestProvider, first?: boolean): Handle {
 		let entryTest: Test;
 
@@ -97,6 +49,10 @@ export class ProviderRegistry extends MatchRegistry<RequestProvider> {
 
 		return super.register(entryTest, value, first);
 	}
+
+	setDefaultProvider(defaultProvider: RequestProvider) {
+		this._defaultValue = defaultProvider;
+	}
 }
 
 /**
@@ -109,7 +65,7 @@ export const filterRegistry = new FilterRegistry(function (response: Response<an
 /**
  * Request providers, which fulfill requests.
  */
-export const providerRegistry = new ProviderRegistry();
+export const providerRegistry = new ProviderRegistry(xhr);
 
 export interface RequestError<T> extends Error {
 	response: Response<T>;
@@ -169,8 +125,9 @@ const request: {
 	get<T>(url: string, options?: RequestOptions): ResponsePromise<T>;
 	post<T>(url: string, options?: RequestOptions): ResponsePromise<T>;
 	put<T>(url: string, options?: RequestOptions): ResponsePromise<T>;
+	setDefaultProvider(provider: RequestProvider): void;
 } = <any> function request<T>(url: string, options: RequestOptions = {}): ResponsePromise<T> {
-	const promise = providerRegistry.match(url, options)(url, options)
+	return providerRegistry.match(url, options)(url, options)
 		.then(function (response: Response<T>) {
 			return Task.resolve(filterRegistry.match(response, url, options)(response, url, options))
 				.then(function (filterResponse: any) {
@@ -178,9 +135,9 @@ const request: {
 					return response;
 				});
 		});
-
-	return promise;
 };
+
+request.setDefaultProvider = provider => providerRegistry.setDefaultProvider(provider);
 
 [ 'DELETE', 'GET', 'POST', 'PUT' ].forEach(function (method) {
 	(<any> request)[method.toLowerCase()] = function <T>(url: string, options: RequestOptions = {}): ResponsePromise<T> {

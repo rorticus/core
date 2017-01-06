@@ -1,61 +1,176 @@
-import Task from '../async/Task';
-import RequestTimeoutError from './errors/RequestTimeoutError';
-import global from '../global';
-import has from '../has';
+import has from '../../has';
+import Headers from '../Headers';
+import { RequestOptions } from '../interfaces';
+import Response, { getArrayBufferFromBlob, getTextFromBlob } from '../Response';
+import TimeoutError from '../TimeoutError';
+import { generateRequestUrl } from '../util';
+import Task, { State } from '../../async/Task';
+import global from '../../global';
+import { createTimer } from '../../util';
 import { Handle } from '@dojo/interfaces/core';
-import { createTimer } from '../util';
-import { RequestOptions, Response, ResponsePromise } from '../request';
-import { generateRequestUrl } from './util';
+import { forOf } from '@dojo/shim/iterator';
+import WeakMap from '@dojo/shim/WeakMap';
 
+/**
+ * Request options specific to an XHR request
+ */
 export interface XhrRequestOptions extends RequestOptions {
 	blockMainThread?: boolean;
 }
 
-/**
- * A lookup table for valid `XMLHttpRequest#responseType` values.
- *
- * 'json' deliberately excluded since it is not supported in all environments, and as there is
- * already a filter for it in '../request'. Default '' and 'text' values also deliberately excluded.
- */
-const responseTypeMap: { [key: string]: string; } = {
-	arraybuffer: 'arraybuffer',
-	// XHR2 environments that do not support `responseType=blob` still support `responseType=arraybuffer`,
-	// which is a better way of handling blob data than as a string representation.
-	blob: has('xhr2-blob') ? 'blob' : 'arraybuffer',
-	document: 'document'
-};
+interface RequestData {
+	task: Task<XMLHttpRequest>;
+	used: boolean;
+	requestOptions: XhrRequestOptions;
+	nativeResponse: XMLHttpRequest;
+	url: string;
+}
 
-/* a noop handle for cancelled requests */
-const noop = function() { };
+const dataMap = new WeakMap<XhrResponse, RequestData>();
 
-/**
- * Converts a string to an array buffer
- * @param str The string to convert
- */
-function stringToArrayBuffer(str: string): ArrayBuffer {
-	const buf = new ArrayBuffer(str.length * 2);
-	const bufView = new Uint8Array(buf);
-	for (let i = 0; i < str.length; i++) {
-		bufView[i] = str.charCodeAt(i);
+function getDataTask(response: XhrResponse): Task<XMLHttpRequest> {
+	const data = dataMap.get(response);
+
+	if (data.used) {
+		return Task.reject<any>(new TypeError('Body already read'));
 	}
-	return buf;
-};
 
-export default function xhr<T>(url: string, options: XhrRequestOptions = {}): ResponsePromise<T> {
+	data.used = true;
+
+	return data.task;
+}
+
+/**
+ * Wraps an XHR request in a response that mimics the fetch API
+ */
+export class XhrResponse extends Response {
+	readonly headers: Headers;
+	readonly ok: boolean;
+	readonly status: number;
+	readonly statusText: string;
+
+	get bodyUsed(): boolean {
+		return dataMap.get(this).used;
+	}
+
+	get nativeResponse(): XMLHttpRequest {
+		return dataMap.get(this).nativeResponse;
+	}
+
+	get requestOptions(): XhrRequestOptions {
+		return dataMap.get(this).requestOptions;
+	}
+
+	get url(): string {
+		return dataMap.get(this).url;
+	}
+
+	constructor(request: XMLHttpRequest) {
+		super();
+
+		const headers = this.headers = new Headers();
+
+		const responseHeaders = request.getAllResponseHeaders();
+		if (responseHeaders) {
+			for (let line of responseHeaders.split(/\r\n/g)) {
+				const match = line.match(/^(.*?): (.*)$/);
+				if (match) {
+					headers.append(match[1], match[2]);
+				}
+			}
+		}
+
+		this.status = request.status;
+		this.ok = this.status >= 200 && this.status < 300;
+		this.statusText = request.statusText || 'OK';
+	}
+
+	arrayBuffer(): Task<ArrayBuffer> {
+		return Task.reject<ArrayBuffer>(new Error('ArrayBuffer not supported'));
+	}
+
+	blob(): Task<Blob> {
+		return Task.reject<Blob>(new Error('Blob not supported'));
+	}
+
+	formData(): Task<FormData> {
+		return Task.reject<FormData>(new Error('FormData not supported'));
+	}
+
+	text(): Task<string> {
+		return <any> getDataTask(this).then((request: XMLHttpRequest) => {
+			return String(request.responseText);
+		});
+	}
+
+	xml(): Task<Document> {
+		return <any> this.text().then((text: string) => {
+			const parser = new DOMParser();
+			return parser.parseFromString(text, this.headers.get('content-type') || 'text/html');
+		});
+	}
+}
+
+if (has('blob')) {
+	XhrResponse.prototype.blob = function (this: XhrResponse): Task<Blob> {
+		return <any> getDataTask(this).then((request: XMLHttpRequest) => request.response);
+	};
+
+	XhrResponse.prototype.text = function (this: XhrResponse): Task<string> {
+		return <any> this.blob().then(getTextFromBlob);
+	};
+
+	if (has('arraybuffer')) {
+		XhrResponse.prototype.arrayBuffer = function (this: XhrResponse): Task<ArrayBuffer> {
+			return <any> this.blob().then(getArrayBufferFromBlob);
+		};
+	}
+}
+
+if (has('formdata')) {
+	XhrResponse.prototype.formData = function (this: XhrResponse): Task<FormData> {
+		return <any> this.text().then((text: string) => {
+			const data = new FormData();
+
+			text.trim().split('&').forEach(keyValues => {
+				if (keyValues) {
+					const pairs = keyValues.split('=');
+					const name = (pairs.shift() || '').replace(/\+/, ' ');
+					const value = pairs.join('=').replace(/\+/, ' ');
+
+					data.append(decodeURIComponent(name), decodeURIComponent(value));
+				}
+			});
+
+			return data;
+		});
+	};
+}
+
+function noop () {}
+
+function setOnError(request: XMLHttpRequest, reject: Function) {
+	request.onerror = function (event) {
+		reject(new TypeError(event.error || 'Network request failed'));
+	};
+}
+
+export default function xhr(url: string, options: XhrRequestOptions = {}): Task<Response> {
 	const request = new XMLHttpRequest();
 	const requestUrl = generateRequestUrl(url, options);
-	const response: Response<T> = {
-		data: null,
-		nativeResponse: request,
-		requestOptions: options,
-		statusCode: null,
-		statusText: null,
-		url: requestUrl,
 
-		getHeader(name: string): null | string {
-			return request.getResponseHeader(name);
-		}
-	};
+	options = Object.create(options);
+
+	if (!options.method) {
+		options.method = 'GET';
+	}
+
+	if ((!options.user || !options.password) && options.auth) {
+		const auth = options.auth.split(':');
+		options.user = decodeURIComponent(auth[ 0 ]);
+		options.password = decodeURIComponent(auth[ 1 ]);
+	}
+
 	let isAborted = false;
 
 	function abort() {
@@ -66,98 +181,130 @@ export default function xhr<T>(url: string, options: XhrRequestOptions = {}): Re
 		}
 	}
 
-	const promise = new Task<Response<T>>(function (resolve, reject): void {
-		if (!options.method) {
-			options.method = 'GET';
-		}
+	let timeoutHandle: Handle;
+	let timeoutReject: Function;
 
-		if ((!options.user || !options.password) && options.auth) {
-			let auth = options.auth.split(':');
-			options.user = decodeURIComponent(auth[0]);
-			options.password = decodeURIComponent(auth[1]);
-		}
+	const task = new Task<Response>((resolve, reject) => {
+		timeoutReject = reject;
 
-		request.open(options.method, requestUrl, !options.blockMainThread, options.user, options.password);
+		request.onreadystatechange = function () {
+			if (isAborted) {
+				return;
+			}
 
-		if (has('xhr2') && options.responseType && options.responseType in responseTypeMap) {
-			request.responseType = responseTypeMap[options.responseType];
-		}
+			if (request.readyState === 2) {
+				const response = new XhrResponse(request);
 
-		let timeoutHandle: Handle;
-		request.onreadystatechange = function (): void {
-			if (!isAborted && request.readyState === 4) {
-				request.onreadystatechange = noop;
-				timeoutHandle && timeoutHandle.destroy();
+				const task = new Task<XMLHttpRequest>((resolve, reject) => {
+					timeoutReject = reject;
 
-				if (options.responseType === 'xml') {
-					response.data = request.responseXML;
-				}
-				else {
-					response.data = ('response' in request) ? request.response : request.responseText;
-					/* Android 4 has a defect where it doesn't respect the responseType
-					 * See https://github.com/dojo/core/issues/125 */
-					if (options.responseType === 'arraybuffer' && typeof response.data === 'string' && has('arraybuffer')) {
-						response.data = <any> stringToArrayBuffer((<any> response).data);
-					}
-				}
+					request.onprogress = function (event: any) {
+						if (isAborted) {
+							return;
+						}
 
-				response.statusCode = request.status;
-				response.statusText = request.statusText;
-				if (response.statusCode > 0 && response.statusCode < 400) {
-					resolve(response);
-				}
-				else {
-					reject(response.statusText ?
-						new Error(response.statusText) :
-						new Error('An error prevented completion of the request.')
-					);
-				}
+						response.emit({
+							type: 'progress',
+							response,
+							totalBytesDownloaded: event.loaded
+						});
+					};
+
+					request.onreadystatechange = function () {
+						if (isAborted) {
+							return;
+						}
+						if (request.readyState === 4) {
+							request.onreadystatechange = noop;
+							timeoutHandle && timeoutHandle.destroy();
+
+							response.emit({
+								type: 'data',
+								response,
+								chunk: request.response
+							});
+
+							response.emit({
+								type: 'end',
+								response
+							});
+
+							resolve(request);
+						}
+					};
+
+					setOnError(request, reject);
+
+					response.emit({
+						type: 'start',
+						response
+					});
+				}, abort);
+
+				dataMap.set(response, {
+					task,
+					used: false,
+					nativeResponse: request,
+					requestOptions: options,
+					url: requestUrl
+				});
+
+				resolve(response);
 			}
 		};
 
-		if (options.timeout > 0 && options.timeout !== Infinity) {
-			timeoutHandle = createTimer(function () {
-				// Reject first, since aborting will also fire onreadystatechange which would reject with a
-				// less specific error.  (This is also why we set up our own timeout rather than using
-				// native timeout and ontimeout, because that aborts and fires onreadystatechange before ontimeout.)
-				reject(new RequestTimeoutError('The XMLHttpRequest request timed out.'));
-				abort();
-			}, options.timeout);
-		}
+		setOnError(request, reject);
 
-		const headers = options.headers;
-		let hasContentTypeHeader = false;
-		let hasRequestedWithHeader = false;
-		if (headers) {
-			for (let header in headers) {
-				if (header.toLowerCase() === 'content-type') {
-					hasContentTypeHeader = true;
-				} else if (header.toLowerCase() === 'x-requested-with') {
-					hasRequestedWithHeader = true;
-				}
-				request.setRequestHeader(header, headers[header]);
-			}
-		}
+	}, abort);
 
-		if (!hasRequestedWithHeader) {
-			request.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
-		}
+	request.open(options.method, requestUrl, !options.blockMainThread, options.user, options.password);
 
-		if (!hasContentTypeHeader && has('formdata') && options.data instanceof global.FormData) {
-			// Assume that most forms do not contain large binary files. If that is not the case,
-			// then "multipart/form-data" should be manually specified as the "Content-Type" header.
-			request.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
-		}
+	if (has('filereader') && has('blob')) {
+		request.responseType = 'blob';
+	}
 
-		if (options.responseType === 'xml' && request.overrideMimeType) {
-			// This forces the XHR to parse the response as XML regardless of the MIME-type returned by the server
-			request.overrideMimeType('text/xml');
-		}
+	if (options.timeout > 0 && options.timeout !== Infinity) {
+		timeoutHandle = createTimer(() => {
+			// Reject first, since aborting will also fire onreadystatechange which would reject with a
+			// less specific error.  (This is also why we set up our own timeout rather than using
+			// native timeout and ontimeout, because that aborts and fires onreadystatechange before ontimeout.)
+			timeoutReject && timeoutReject(new TimeoutError('The XMLHttpRequest request timed out'));
+			abort();
+		}, options.timeout);
+	}
 
-		request.send(options.data);
-	}, function () {
-		abort();
+	let hasContentTypeHeader = false;
+	let hasRequestedWithHeader = false;
+
+	if (options.headers) {
+		const requestHeaders = new Headers(options.headers);
+
+		hasRequestedWithHeader = requestHeaders.has('x-requested-with');
+		hasContentTypeHeader = requestHeaders.has('content-type');
+
+		forOf(requestHeaders, ([key, value]) => {
+			request.setRequestHeader(key, value);
+		});
+	}
+
+	if (!hasRequestedWithHeader) {
+		request.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+	}
+
+	if (!hasContentTypeHeader && has('formdata') && options.body instanceof global.FormData) {
+		// Assume that most forms do not contain large binary files. If that is not the case,
+		// then "multipart/form-data" should be manually specified as the "Content-Type" header.
+		request.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+	}
+
+	task.finally(() => {
+		if (task.state !== State.Fulfilled) {
+			request.onreadystatechange = noop;
+			timeoutHandle && timeoutHandle.destroy();
+		}
 	});
 
-	return promise;
+	request.send(options.body || null);
+
+	return task;
 }

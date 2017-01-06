@@ -1,43 +1,22 @@
-import Task from '../async/Task';
-import RequestTimeoutError from './errors/RequestTimeoutError';
+import Headers from '../Headers';
+import { RequestOptions } from '../interfaces';
+import Response from '../Response';
+import TimeoutError from '../TimeoutError';
+import Task from '../../async/Task';
+import { queueTask } from '../../queue';
+import { createTimer } from '../../util';
 import { Handle } from '@dojo/interfaces/core';
+import Set from '@dojo/shim/Set';
+import WeakMap from '@dojo/shim/WeakMap';
+
 import * as http from 'http';
 import * as https from 'https';
-import { createHandle } from '../lang';
-import { RequestOptions, Response, ResponsePromise } from '../request';
 import * as urlUtil from 'url';
-import { generateRequestUrl } from './util';
 
-// TODO: Where should the dojo version come from? It used to be kernel, but we don't have that.
-let version = '2.0.0-pre';
-
-const DEFAULT_REDIRECT_LIMIT = 15;
-
-interface Options {
-	agent?: any;
-	auth?: string;
-	headers?: { [name: string]: string; };
-	host?: string;
-	hostname?: string;
-	localAddress?: string;
-	method?: string;
-	path?: string;
-	port?: number;
-	socketPath?: string;
-}
-
-interface HttpsOptions extends Options {
-	ca?: any;
-	cert?: string;
-	ciphers?: string;
-	key?: string;
-	passphrase?: string;
-	pfx?: any;
-	rejectUnauthorized?: boolean;
-	secureProtocol?: string;
-}
-
-export interface NodeRequestOptions<T> extends RequestOptions {
+/**
+ * Request options specific to a node request
+ */
+export interface NodeRequestOptions extends RequestOptions {
 	agent?: any;
 	ca?: any;
 	cert?: string;
@@ -57,7 +36,6 @@ export interface NodeRequestOptions<T> extends RequestOptions {
 		noDelay?: boolean;
 		timeout?: number;
 	};
-	streamData?: boolean;
 	streamEncoding?: string;
 	redirectOptions?: {
 		limit?: number;
@@ -66,7 +44,161 @@ export interface NodeRequestOptions<T> extends RequestOptions {
 	};
 }
 
-function redirect<T>(resolve: (p?: any) => void, reject: (_?: Error) => void, url: string, options: NodeRequestOptions<T>): boolean {
+// TODO: This should be read from the package and not hard coded!
+let version = '2.0.0-pre';
+
+/**
+ * If not overridden, redirects will only be processed this many times before aborting (per request).
+ * @type {number}
+ */
+const DEFAULT_REDIRECT_LIMIT = 15;
+
+/**
+ * Options to be passed to node's request
+ */
+interface Options {
+	agent?: any;
+	auth?: string;
+	headers?: { [name: string]: string; };
+	host?: string;
+	hostname?: string;
+	localAddress?: string;
+	method?: string;
+	path?: string;
+	port?: number;
+	socketPath?: string;
+}
+
+/**
+ * HTTPS specific options for node
+ */
+interface HttpsOptions extends Options {
+	ca?: any;
+	cert?: string;
+	ciphers?: string;
+	key?: string;
+	passphrase?: string;
+	pfx?: any;
+	rejectUnauthorized?: boolean;
+	secureProtocol?: string;
+}
+
+interface RequestData {
+	task: Task<http.IncomingMessage>;
+	buffer: any[];
+	data: string;
+	size: number;
+	used: boolean;
+	nativeResponse: http.IncomingMessage;
+	requestOptions: NodeRequestOptions;
+	url: string;
+}
+
+const dataMap = new WeakMap<NodeResponse, RequestData>();
+const discardedDuplicates = new Set<string>([
+	'age', 'authorization', 'content-length', 'content-type', 'etag',
+	'expires', 'from', 'host', 'if-modified-since', 'if-unmodified-since',
+	'last-modified', 'location', 'max-forwards', 'proxy-authorization',
+	'referer', 'retry-after', 'user-agent'
+]);
+
+function getDataTask(response: NodeResponse): Task<RequestData> {
+	const data = dataMap.get(response);
+
+	if (data.used) {
+		return Task.reject<any>(new TypeError('Body already read'));
+	}
+
+	data.used = true;
+
+	return <Task<RequestData>> data.task.then(_ => data);
+}
+
+/**
+ * Turn a node native response object into something that resembles the fetch api
+ */
+export class NodeResponse extends Response {
+	readonly headers: Headers;
+	readonly ok: boolean;
+	readonly status: number;
+	readonly statusText: string;
+
+	downloadBody: boolean = true;
+
+	get bodyUsed(): boolean {
+		return dataMap.get(this).used;
+	}
+
+	get nativeResponse(): http.IncomingMessage {
+		return dataMap.get(this).nativeResponse;
+	}
+
+	get requestOptions(): NodeRequestOptions {
+		return dataMap.get(this).requestOptions;
+	}
+
+	get url(): string {
+		return dataMap.get(this).url;
+	}
+
+	constructor(response: http.IncomingMessage) {
+		super();
+
+		const headers = this.headers = new Headers();
+		for (let key in response.headers) {
+			if (discardedDuplicates.has(key)) {
+				headers.append(key, response.headers[key]);
+			}
+			else if (key === 'set-cookie') {
+				(<string[]> response.headers[key]).forEach(value => {
+					headers.append(key, value);
+				});
+			}
+			else {
+				const values: string[] = response.headers[key].split(', ');
+				values.forEach(value => {
+					headers.append(key, value);
+				});
+			}
+		}
+
+		this.status = response.statusCode || 0;
+		this.ok = this.status >= 200 && this.status < 300;
+		this.statusText = response.statusMessage || '';
+	}
+
+	arrayBuffer(): Task<ArrayBuffer> {
+		return <any> getDataTask(this).then(data => {
+			if (data) {
+				if (<any> data.data instanceof Buffer) {
+					return data.data;
+				}
+				else {
+					return Buffer.from(data.data, 'utf8');
+				}
+			}
+
+			return new Buffer([]);
+		});
+	}
+
+	blob(): Task<Blob> {
+		// Node doesn't support Blobs
+		return Task.reject<Blob>(new Error('Blob not supported'));
+	}
+
+	formData(): Task<FormData> {
+		return Task.reject<FormData>(new Error('FormData not supported'));
+	}
+
+	text(): Task<string> {
+		return <any> getDataTask(this).then(data => {
+			return String(data ? data.data : '');
+		});
+	}
+}
+
+function redirect(resolve: (p?: any) => void, reject: (_?: Error) => void, url: string | null, options: NodeRequestOptions): boolean {
 	if (!options.redirectOptions) {
 		options.redirectOptions = {};
 	}
@@ -96,9 +228,9 @@ function redirect<T>(resolve: (p?: any) => void, reject: (_?: Error) => void, ur
 	return true;
 }
 
-export default function node<T>(url: string, options: NodeRequestOptions<T> = {}): ResponsePromise<T> {
-	const requestUrl = generateRequestUrl(url, options);
-	const parsedUrl = urlUtil.parse(options.proxy || requestUrl);
+export default function node(url: string, options: NodeRequestOptions = {}): Task<Response> {
+	const parsedUrl = urlUtil.parse(options.proxy || url);
+
 	const requestOptions: HttpsOptions = {
 		agent: options.agent,
 		auth: parsedUrl.auth || options.auth,
@@ -119,23 +251,23 @@ export default function node<T>(url: string, options: NodeRequestOptions<T> = {}
 		socketPath: options.socketPath
 	};
 
-	requestOptions.headers = options.headers || {};
+	requestOptions.headers = <{ [key: string]: string }> options.headers || {};
 
 	if (!Object.keys(requestOptions.headers).map(headerName => headerName.toLowerCase()).some(headerName => headerName === 'user-agent')) {
-		requestOptions.headers['user-agent'] = 'dojo/' + version + ' Node.js/' + process.version.replace(/^v/, '');
+		requestOptions.headers[ 'user-agent' ] = 'dojo/' + version + ' Node.js/' + process.version.replace(/^v/, '');
 	}
 
 	if (options.proxy) {
-		requestOptions.path = requestUrl;
+		requestOptions.path = url;
 		if (parsedUrl.auth) {
-			requestOptions.headers['proxy-authorization'] = 'Basic ' + new Buffer(parsedUrl.auth).toString('base64');
+			requestOptions.headers[ 'proxy-authorization' ] = 'Basic ' + new Buffer(parsedUrl.auth).toString('base64');
 		}
 
-		let _parsedUrl = urlUtil.parse(requestUrl);
-		if (_parsedUrl.host) {
-			requestOptions.headers['host'] = _parsedUrl.host;
+		const parsedProxyUrl = urlUtil.parse(url);
+		if (parsedProxyUrl.host) {
+			requestOptions.headers[ 'host' ] = parsedProxyUrl.host;
 		}
-		requestOptions.auth = _parsedUrl.auth || options.auth;
+		requestOptions.auth = parsedProxyUrl.auth || options.auth;
 	}
 
 	if (!options.auth && (options.user || options.password)) {
@@ -143,17 +275,11 @@ export default function node<T>(url: string, options: NodeRequestOptions<T> = {}
 	}
 
 	const request = parsedUrl.protocol === 'https:' ? https.request(requestOptions) : http.request(requestOptions);
-	const response: Response<T> = {
-		data: null,
-		getHeader: function (this: Response<T>, name: string): string {
-			return (this.nativeResponse && this.nativeResponse.headers[name.toLowerCase()]) || null;
-		},
-		requestOptions: options,
-		statusCode: null,
-		url: requestUrl
-	};
 
-	const promise = new Task<Response<T>>(function (resolve, reject) {
+	const task = new Task<Response>((resolve, reject) => {
+		let timeoutHandle: Handle;
+		let timeoutReject: Function = reject;
+
 		if (options.socketOptions) {
 			if (options.socketOptions.timeout) {
 				request.setTimeout(options.socketOptions.timeout);
@@ -169,21 +295,19 @@ export default function node<T>(url: string, options: NodeRequestOptions<T> = {}
 			}
 		}
 
-		let timeout: Handle;
-		request.once('response', function (nativeResponse: http.ClientResponse): void {
-			response.nativeResponse = nativeResponse;
-			response.statusCode = nativeResponse.statusCode;
+		request.once('response', (message: http.IncomingMessage) => {
+			const response = new NodeResponse(message);
 
 			// Redirection handling defaults to true in order to harmonise with the XHR provider, which will always
 			// follow redirects
 			if (
-				response.statusCode >= 300 &&
-				response.statusCode < 400
+				response.status >= 300 &&
+				response.status < 400
 			) {
 				const redirectOptions = options.redirectOptions || {};
 				const newOptions = Object.create(options);
 
-				switch (response.statusCode) {
+				switch (response.status) {
 					case 300:
 						/**
 						 * Note about 300 redirects. RFC 2616 doesn't specify what to do with them, it is up to the client to "pick
@@ -211,7 +335,7 @@ export default function node<T>(url: string, options: NodeRequestOptions<T> = {}
 							newOptions.method = 'GET';
 						}
 
-						if (redirect<T>(resolve, reject, nativeResponse.headers.location, newOptions)) {
+						if (redirect(resolve, reject, response.headers.get('location'), newOptions)) {
 							return;
 						}
 						break;
@@ -226,7 +350,7 @@ export default function node<T>(url: string, options: NodeRequestOptions<T> = {}
 							newOptions.method = 'GET';
 						}
 
-						if (redirect<T>(resolve, reject, nativeResponse.headers.location, newOptions)) {
+						if (redirect(resolve, reject, response.headers.get('location'), newOptions)) {
 							return;
 						}
 						break;
@@ -237,11 +361,12 @@ export default function node<T>(url: string, options: NodeRequestOptions<T> = {}
 						break;
 
 					case 305:
-						if (!nativeResponse.headers.location) {
+						if (!response.headers.get('location')) {
 							reject(new Error('expected Location header to contain a proxy url'));
-						} else {
-							newOptions.proxy = nativeResponse.headers.location;
-							if (redirect<T>(resolve, reject, requestUrl, newOptions)) {
+						}
+						else {
+							newOptions.proxy = response.headers.get('location') || '';
+							if (redirect(resolve, reject, url, newOptions)) {
 								return;
 							}
 						}
@@ -254,81 +379,117 @@ export default function node<T>(url: string, options: NodeRequestOptions<T> = {}
 						 *  request unless it can be confirmed by the user, since this might
 						 *  change the conditions under which the request was issued.
 						 */
-						if (redirect<T>(resolve, reject, nativeResponse.headers.location, newOptions)) {
+						if (redirect(resolve, reject, response.headers.get('location'), newOptions)) {
 							return;
 						}
 						break;
 
 					default:
-						reject(new Error('unhandled redirect status ' + response.statusCode));
+						reject(new Error('unhandled redirect status ' + response.status));
 						return;
 				}
 			}
 
-			options.streamEncoding && nativeResponse.setEncoding(options.streamEncoding);
+			options.streamEncoding && message.setEncoding(options.streamEncoding);
 
-			let data: any[];
-			let loaded: number;
-			if (!options.streamData) {
-				data = [];
-				loaded = 0;
+			const task = new Task<http.IncomingMessage>((resolve, reject) => {
+				timeoutReject = reject;
 
-				nativeResponse.on('data', function (chunk: any): void {
-					data.push(chunk);
-					loaded += (typeof chunk === 'string') ?
-						Buffer.byteLength(chunk, options.streamEncoding) :
-						chunk.length;
+				// we queue this up for later to allow listeners to register themselves before we start receiving data
+				queueTask(() => {
+					response.emit({
+						type: 'start',
+						response
+					});
+
+					message.on('data', (chunk: any) => {
+						response.emit({
+							type: 'data',
+							response,
+							chunk: chunk
+						});
+
+						if (response.downloadBody) {
+							data.buffer.push(chunk);
+						}
+
+						data.size += typeof chunk === 'string' ?
+							Buffer.byteLength(chunk, options.streamEncoding) :
+							chunk.length;
+
+						response.emit({
+							type: 'progress',
+							response,
+							totalBytesDownloaded: data.size
+						});
+					});
+
+					message.once('end', () => {
+						timeoutHandle && timeoutHandle.destroy();
+
+						data.data = (options.streamEncoding ? data.buffer.join('') : String(Buffer.concat(data.buffer, data.size)));
+
+						response.emit({
+							type: 'end',
+							response
+						});
+
+						resolve(message);
+					});
 				});
-			}
-
-			nativeResponse.once('end', function (): void {
-				timeout && timeout.destroy();
-
-				if (!options.streamData) {
-					// TODO: what type should data have?
-					response.data = <any> (options.streamEncoding ? data.join('') : Buffer.concat(data, loaded));
-				}
-
-				resolve(response);
+			}, () => {
+				request.abort();
 			});
+
+			const data: RequestData = {
+				task,
+				buffer: [],
+				data: '',
+				size: 0,
+				used: false,
+				url: url,
+				requestOptions: options,
+				nativeResponse: message
+			};
+
+			dataMap.set(response, data);
+
+			resolve(response);
 		});
 
 		request.once('error', reject);
 
-		if (options.data) {
-			request.end(options.data);
+		if (options.body) {
+			if (options.body instanceof Buffer) {
+				request.end(options.body.toString());
+			}
+			else {
+				request.end(options.body.toString());
+			}
 		}
 		else {
 			request.end();
 		}
 
 		if (options.timeout > 0 && options.timeout !== Infinity) {
-			timeout = (function (): Handle {
-				const timer = setTimeout(function (): void {
-					const error = new RequestTimeoutError('Request timed out after ' + options.timeout + 'ms');
-					error.response = response;
-					reject(error);
-				}, options.timeout);
-
-				return createHandle(function (): void {
-					clearTimeout(timer);
-				});
-			})();
+			timeoutHandle = createTimer(() => {
+				timeoutReject && timeoutReject(new TimeoutError('The request timed out'));
+			}, options.timeout);
 		}
-	}, function () {
+	}, () => {
 		request.abort();
 	}).catch(function (error: Error): any {
-		let parsedUrl = urlUtil.parse(url);
+		const parsedUrl = urlUtil.parse(url);
 
 		if (parsedUrl.auth) {
 			parsedUrl.auth = '(redacted)';
 		}
 
-		let sanitizedUrl = urlUtil.format(parsedUrl);
+		const sanitizedUrl = urlUtil.format(parsedUrl);
 
 		error.message = '[' + requestOptions.method + ' ' + sanitizedUrl + '] ' + error.message;
 		throw error;
 	});
 
-	return promise;
+	return task;
 }

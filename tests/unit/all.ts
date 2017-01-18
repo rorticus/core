@@ -15,6 +15,7 @@ import './load/webpack';
 import './main';
 import './Observable';
 import './on/all';
+import './OrderedMap';
 import './MatchRegistry';
 import './queue';
 import './request';

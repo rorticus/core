@@ -249,7 +249,7 @@ registerSuite({
 			}
 			else if (hasUint16Array) {
 				let buffer = new Uint16Array(UTF8_BUFFER);
-				assert.strictEqual(utf8.decode(buffer), UTF8_STRING);
+				assert.strictEqual(utf8.decode(<any> buffer), UTF8_STRING);
 			}
 		}
 	}
